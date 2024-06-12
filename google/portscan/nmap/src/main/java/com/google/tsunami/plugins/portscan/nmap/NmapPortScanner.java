@@ -22,10 +22,12 @@ import com.google.common.base.Ascii;
 import com.google.common.base.Splitter;
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
 import com.google.common.flogger.GoogleLogger;
 import com.google.tsunami.common.command.CommandExecutionThreadPool;
 import com.google.tsunami.common.data.NetworkEndpointUtils;
 import com.google.tsunami.common.data.NetworkServiceUtils;
+import com.google.tsunami.common.net.http.HttpClientCliOptions;
 import com.google.tsunami.plugin.PluginType;
 import com.google.tsunami.plugin.PortScanner;
 import com.google.tsunami.plugin.annotations.PluginInfo;
@@ -78,6 +80,7 @@ public final class NmapPortScanner implements PortScanner {
   private final Executor commandExecutor;
   private final NmapPortScannerConfigs configs;
   private final NmapPortScannerCliOptions cliOptions;
+  private final HttpClientCliOptions httpClientCliOptions;
 
   private ScanTarget scanTarget;
 
@@ -86,11 +89,13 @@ public final class NmapPortScanner implements PortScanner {
       NmapClient nmapClient,
       @CommandExecutionThreadPool Executor commandExecutor,
       NmapPortScannerConfigs configs,
-      NmapPortScannerCliOptions cliOptions) {
+      NmapPortScannerCliOptions cliOptions,
+      HttpClientCliOptions httpClientCliOptions) {
     this.nmapClient = checkNotNull(nmapClient);
     this.commandExecutor = checkNotNull(commandExecutor);
     this.configs = checkNotNull(configs);
     this.cliOptions = checkNotNull(cliOptions);
+    this.httpClientCliOptions = checkNotNull(httpClientCliOptions);
   }
 
   @Override
@@ -108,8 +113,11 @@ public final class NmapPortScanner implements PortScanner {
               .withServiceAndVersionDetection()
               .withVersionDetectionIntensity(5)
               .withScript("banner")
+              .withScript("ssl-enum-ciphers")
+              .withScript("http-methods", "http.useragent=" + httpClientCliOptions.userAgent)
               .withTimingTemplate(TimingTemplate.AGGRESSIVE)
               .withTargetNetworkEndpoint(scanTarget.getNetworkEndpoint())
+              .withExtraCommandLineOptions(cliOptions.nmapCmdOpts)
               .run(commandExecutor);
       logger.atInfo().log(
           "Finished nmap scan on target '%s' in %s.",
@@ -257,6 +265,8 @@ public final class NmapPortScanner implements PortScanner {
     getSoftwareVersionSetFromPort(port).ifPresent(networkServiceBuilder::setVersionSet);
     getBannerScriptFromPort(port)
         .ifPresent(script -> networkServiceBuilder.addBanner(script.output()));
+    getSslVersionsScriptFromPort(port).forEach(networkServiceBuilder::addSupportedSslVersions);
+    getHttpMethodsScriptFromPort(port).forEach(networkServiceBuilder::addSupportedHttpMethods);
     return networkServiceBuilder.build();
   }
 
@@ -264,6 +274,47 @@ public final class NmapPortScanner implements PortScanner {
     return port.scripts().stream()
         .filter(script -> Ascii.equalsIgnoreCase("banner", Strings.nullToEmpty(script.id())))
         .findFirst();
+  }
+
+  private static ImmutableList<String> getSslVersionsScriptFromPort(Port port) {
+    return port.scripts().stream()
+        .filter(sc -> Ascii.equalsIgnoreCase("ssl-enum-ciphers", Strings.nullToEmpty(sc.id())))
+        .flatMap(sc -> sc.tables().stream())
+        .map(table -> Ascii.toUpperCase(table.key()))
+        .collect(toImmutableList());
+  }
+
+  private static ImmutableList<String> getHttpMethodsScriptFromPort(Port port) {
+    var httpMethods =
+        port.scripts().stream()
+            .filter(
+                script -> Ascii.equalsIgnoreCase("http-methods", Strings.nullToEmpty(script.id())))
+            .flatMap(script -> script.tables().stream())
+            .flatMap(table -> table.elems().stream())
+            .map(elt -> Ascii.toUpperCase(elt.value()))
+            .collect(toImmutableList());
+
+    if (!httpMethods.isEmpty()) {
+      return httpMethods;
+    }
+
+    // Some server do not support or do not answer to the OPTIONS request (e.g. confluence)
+    // sent by nmap's script. In that case, we can still perform a best-effort matching using the
+    // "fingerprint-strings" script that is started at the same time.
+    var getRequestCount = port.scripts().stream()
+        .filter(
+            script ->
+                Ascii.equalsIgnoreCase("fingerprint-strings", Strings.nullToEmpty(script.id())))
+        .flatMap(script -> script.elems().stream())
+        .filter(elt -> elt.key().contains("GetRequest"))
+        .filter(elt -> elt.value().contains("HTTP/1."))
+        .count();
+
+    if (getRequestCount > 0) {
+      return ImmutableList.of("GET");
+    }
+
+    return ImmutableList.of();
   }
 
   private static Optional<Host> getHostFromNmapRun(NmapRun nmapRun) {
